@@ -6,6 +6,8 @@ mod shape;
 pub(crate) mod sheet;
 pub(crate) mod ttml;
 
+pub use shape::{estimate_line_words, estimate_words_if_needed, plain_lyrics_fragments};
+
 use std::collections::HashSet;
 use std::time::Duration;
 

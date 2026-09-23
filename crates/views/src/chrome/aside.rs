@@ -5,8 +5,8 @@ use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, Context, Div, DragMoveEvent, Entity, FontWeight,
     MouseDownEvent, Pixels, Point, Render, ScrollHandle, ScrollStrategy, SharedString,
-    SpringConfig, SpringState, Task, UniformListScrollHandle, Window, div, ease_in_out, px,
-    relative, svg, uniform_list,
+    SpringConfig, SpringState, Task, UniformListScrollHandle, Window, div, ease_in_out, px, svg,
+    uniform_list,
 };
 use i18n::t;
 use music::{Shape, Track, Voice};
@@ -38,6 +38,7 @@ const HAZE: f32 = 0.45;
 const VERSE_FADE: f32 = 1.25;
 const PAST: f32 = 0.4;
 const AHEAD: f32 = 0.6;
+#[allow(dead_code)]
 const REVEAL: f32 = 0.6;
 const ACTIVE_VERSE_GROWTH: Pixels = px(2.);
 const FULLSCREEN_VERSE_GROWTH: Pixels = px(3.);
@@ -68,13 +69,17 @@ const RESOLVE_BLUR: f32 = 0.2;
 const RESOLVE_FADE: f32 = 0.5;
 const SETTLE: std::time::Duration = std::time::Duration::from_secs(4);
 const INSTRUMENTAL_BREAK: std::time::Duration = std::time::Duration::from_secs(5);
+#[allow(dead_code)]
 const SWEEP_LEAST: std::time::Duration = std::time::Duration::from_millis(180);
 // karaoke sweep ceiling
 const KARAOKE_HZ: u32 = 45;
 const KARAOKE_FRAME: std::time::Duration =
     std::time::Duration::from_nanos(1_000_000_000 / KARAOKE_HZ as u64);
+#[allow(dead_code)]
 const SWEEP_STRETCH: f32 = 1.4;
+#[allow(dead_code)]
 const SWEPT: f32 = 0.98;
+#[allow(dead_code)]
 const LANDING: f32 = 0.2;
 // what a lane row actually takes, plus the gaps between lanes
 const LANE_GAP_REM: f32 = 0.25;
@@ -213,6 +218,7 @@ struct Sung {
     scripts: Option<RomanizationScripts>,
     theme: ui::Theme,
     karaoke_tint: gpui::Hsla,
+    base_tint: gpui::Hsla,
     lift: f32,
     from: gpui::Point<f32>,
 }
@@ -306,6 +312,7 @@ pub(crate) struct Aside {
     sweeping: Option<Task<()>>,
     showed: bool,
     resolving: bool,
+    prepared_verses: Option<(u64, bool, Vec<music::LyricsLine>)>,
 }
 
 impl Aside {
@@ -400,6 +407,7 @@ impl Aside {
             sweeping: None,
             showed: false,
             resolving: false,
+            prepared_verses: None,
         }
     }
 
@@ -536,6 +544,7 @@ impl Aside {
         self.previous_active_line = None;
         self.departing_line = None;
         self.placing = true;
+        self.prepared_verses = None;
         self.forget_measurements();
     }
 
@@ -977,18 +986,18 @@ impl Aside {
                     .then(|| settings.romanization_scripts()),
             )
         };
-        let karaoke_effects = karaoke_lyrics && effects();
         let scale = match self.titled {
             true => self.settings.read(cx).panel_lyrics_scale(),
             false => self.settings.read(cx).fullscreen_lyrics_scale(),
         };
         let lane_size = theme.text(Text::Body) * scale;
         let sung = Sung {
-            karaoke: karaoke_effects,
+            karaoke: karaoke_lyrics,
             lane: lane_size,
             scripts: romanization_scripts,
             theme,
             karaoke_tint: theme.foreground,
+            base_tint: theme.muted_foreground,
             lift: 1.,
             from: gpui::point(0., 0.5),
         };
@@ -1018,8 +1027,30 @@ impl Aside {
                 .into_any_element()
         };
         let lines = match (&state, &shown) {
-            (LyricsState::Ready, Some(music::Lyrics::Synced { lines })) => Some(lines.clone()),
-            _ => None,
+            (LyricsState::Ready, Some(music::Lyrics::Synced { lines })) => {
+                let prepared = match &self.prepared_verses {
+                    Some((prepared_take, prepared_karaoke, verses))
+                        if *prepared_take == take && *prepared_karaoke == karaoke_lyrics =>
+                    {
+                        verses.clone()
+                    }
+                    _ => {
+                        let verses = if karaoke_lyrics {
+                            music::lyrics::estimate_words_if_needed(lines)
+                        } else {
+                            lines.to_vec()
+                        };
+                        self.prepared_verses = Some((take, karaoke_lyrics, verses.clone()));
+                        self.forget_measurements();
+                        verses
+                    }
+                };
+                Some(prepared)
+            }
+            _ => {
+                self.prepared_verses = None;
+                None
+            }
         };
 
         // aim before reading
@@ -1069,13 +1100,14 @@ impl Aside {
             (Some(lines), _) => {
                 let active_line = sung_line(lines, position);
                 if singing
-                    && karaoke_effects
+                    && karaoke_lyrics
                     && lines.iter().enumerate().any(|(index, line)| {
                         line.worded()
                             && primary_karaoke_visible(line, Some(index) == active_line, position)
                     })
                 {
                     self.sweep_karaoke(window, cx);
+                    window.request_animation_frame();
                 }
                 if self.previous_active_line != active_line {
                     if self.previous_active_line.is_some() {
@@ -1201,10 +1233,6 @@ impl Aside {
                     let translation = presentation + drift;
                     let active = Some(index) == active_line;
                     let departing = Some(index) == self.departing_line;
-                    let karaoke = karaoke_effects
-                        && line.worded()
-                        && primary_karaoke_visible(line, active, position);
-                    let primary_karaoke = karaoke && line.words.is_some();
                     if let std::collections::hash_map::Entry::Vacant(slot) =
                         self.lyrics_wraps.entry(index)
                     {
@@ -1218,7 +1246,7 @@ impl Aside {
                     let wrapped = self.lyrics_wraps.get(&index);
                     let line_has_ended = active_line.is_some_and(|active| index < active)
                         || line_has_passed(line, position);
-                    let worded = karaoke_effects && line.worded() && line.words.is_some();
+                    let worded = karaoke_lyrics && line.worded() && line.words.is_some();
                     let shade = |singing: bool| match (singing, line_has_ended) {
                         (true, _) if worded => theme.muted_foreground,
                         (true, _) => theme.foreground,
@@ -1251,6 +1279,7 @@ impl Aside {
                             tint,
                             primary_karaoke_fade(line, active, position),
                         ),
+                        base_tint: tint,
                         lift,
                         from: match line.voice.lead() {
                             true => gpui::point(0., 0.5),
@@ -1259,11 +1288,21 @@ impl Aside {
                         ..sung
                     };
 
-                    let primary = match (primary_karaoke, line.words.as_ref(), wrapped) {
-                        (true, Some(words), Some(plan)) => {
+                    let primary = match (karaoke_lyrics, line.words.as_ref(), wrapped) {
+                        (true, Some(words), Some(plan)) if !words.is_empty() => {
                             karaoke_lane(plan, line.start, words, position, verse, line.voice, sung)
                                 .into_any_element()
                         }
+                        (true, Some(words), None) if !words.is_empty() => karaoke_lane(
+                            &loose_plan(&line.text, words),
+                            line.start,
+                            words,
+                            position,
+                            verse,
+                            line.voice,
+                            sung,
+                        )
+                        .into_any_element(),
                         (_, _, Some(plan)) => {
                             fixed_lyrics_lane(&plan.text, line.voice, sung).into_any_element()
                         }
@@ -1893,73 +1932,93 @@ fn loose_plan(line: &str, words: &[music::LyricsWord]) -> Wrapped {
     }
 }
 
+fn word_spotlight(
+    words: &[music::LyricsWord],
+    word_index: usize,
+    position: std::time::Duration,
+) -> f32 {
+    let Some(word) = words.get(word_index) else {
+        return 0.;
+    };
+    let start = word.start;
+    let next_start = words.get(word_index + 1).map(|next| next.start);
+    let end = match next_start {
+        Some(next) if next > start => word.end.max(next),
+        _ => word.end.max(start),
+    };
+    let end = end.max(start + std::time::Duration::from_millis(100));
+
+    let lead_in_ms = 75.0;
+    let fade_out_ms = 150.0;
+
+    let pos_ms = position.as_secs_f64() * 1000.0;
+    let start_ms = start.as_secs_f64() * 1000.0;
+    let end_ms = end.as_secs_f64() * 1000.0;
+
+    if pos_ms < start_ms {
+        let diff = start_ms - pos_ms;
+        if diff <= lead_in_ms {
+            let t = (1.0 - diff / lead_in_ms) as f32;
+            0.5 * (1.0 - (std::f32::consts::PI * t).cos())
+        } else {
+            0.
+        }
+    } else if pos_ms < end_ms {
+        1.0
+    } else {
+        let elapsed = pos_ms - end_ms;
+        if elapsed < fade_out_ms {
+            let t = (1.0 - elapsed / fade_out_ms) as f32;
+            0.5 * (1.0 - (std::f32::consts::PI * t).cos())
+        } else {
+            0.
+        }
+    }
+}
+
 fn karaoke_lane(
     plan: &Wrapped,
-    line_start: std::time::Duration,
+    _line_start: std::time::Duration,
     words: &[music::LyricsWord],
     position: std::time::Duration,
-    verse: Pixels,
+    _verse: Pixels,
     voice: Voice,
     sung: Sung,
 ) -> Div {
-    let edge_fade = verse * REVEAL;
-    let Wrapped {
-        fragments,
-        spoken,
-        evenly,
-        ..
-    } = plan;
-    let windows = (0..words.len())
-        .map(|word| {
-            let (start, end) = karaoke_window(line_start, words, word);
-            (start, end, word + 1 >= words.len())
-        })
-        .collect::<Vec<_>>();
-    let sweep = |word: usize| match (windows.get(word), evenly.get(word)) {
-        (Some(&(start, end, _)), Some(true)) => progress_between(start, end, position),
-        (Some(&(start, end, tail)), _) => swept(start, end, position, tail),
-        (None, _) => 0.,
-    };
-    let overlay = |text: SharedString, reveal: Reveal, tint: gpui::Hsla| {
-        div()
-            .absolute()
-            .left_0()
-            .top_0()
-            .bottom_0()
-            .map(|this| match reveal.width {
-                Some(width) => this.w(width),
-                None => this.w(relative(reveal.share)),
-            })
-            .overflow_hidden()
-            .text_color(tint)
-            .when(reveal.landing > 0., |this| {
-                this.fade_sides(px(0.), edge_fade * reveal.landing)
-            })
-            .child(div().whitespace_nowrap().child(text))
-    };
-    let lit = |text: SharedString, reveal: Reveal| {
-        div()
-            .relative()
-            .flex_none()
-            .whitespace_nowrap()
-            .child(text.clone())
-            .when(reveal.shown, |this| {
-                this.child(overlay(text, reveal, sung.karaoke_tint))
-            })
-    };
-
     match plan.rows.is_empty() {
         false => div()
             .flex()
             .flex_col()
             .text_left()
             .children((0..plan.rows.len()).map(|row| {
-                let reveal = revealed(plan, row, &windows, position, edge_fade);
                 lifted(
                     div()
                         .flex()
+                        .flex_row()
+                        .whitespace_nowrap()
                         .when(!voice.lead(), |this| this.justify_end())
-                        .child(lit(plan.text[row].clone(), reveal)),
+                        .children(plan.rows[row].clone().map(|index| {
+                            let text = plan.fragments[index].clone();
+                            let width = plan.widths.get(index).copied();
+                            let word_idx = plan.spoken.get(index).copied().unwrap_or(index);
+                            let h = word_spotlight(words, word_idx, position);
+                            let tint = mix(sung.base_tint, sung.karaoke_tint, h);
+                            let weight = if h > 0.4 {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::SEMIBOLD
+                            };
+                            let scale = 1.0 + 0.04 * h;
+                            div()
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .text_color(tint)
+                                .font_weight(weight)
+                                .layer_scale(scale)
+                                .layer_scale_origin(gpui::point(0.5, 0.5))
+                                .when_some(width, |this, w| this.w(w))
+                                .child(text)
+                        })),
                     sung,
                 )
             })),
@@ -1968,84 +2027,28 @@ fn karaoke_lane(
             .flex_wrap()
             .text_left()
             .when(!voice.lead(), |this| this.justify_end())
-            .children((0..fragments.len()).map(|index| {
-                let share = sweep(spoken.get(index).copied().unwrap_or(index));
-                let reveal = Reveal {
-                    shown: share > 0.,
-                    width: None,
-                    share,
-                    landing: match share < 1. {
-                        true => ((1. - share) / LANDING).min(1.),
-                        false => 0.,
-                    },
+            .children((0..plan.fragments.len()).map(|index| {
+                let text = plan.fragments[index].clone();
+                let width = plan.widths.get(index).copied();
+                let word_idx = plan.spoken.get(index).copied().unwrap_or(index);
+                let h = word_spotlight(words, word_idx, position);
+                let tint = mix(sung.base_tint, sung.karaoke_tint, h);
+                let weight = if h > 0.4 {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::SEMIBOLD
                 };
-                lit(fragments[index].clone(), reveal)
+                let scale = 1.0 + 0.04 * h;
+                div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .text_color(tint)
+                    .font_weight(weight)
+                    .layer_scale(scale)
+                    .layer_scale_origin(gpui::point(0.5, 0.5))
+                    .when_some(width, |this, w| this.w(w))
+                    .child(text)
             })),
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Reveal {
-    shown: bool,
-    width: Option<Pixels>,
-    share: f32,
-    landing: f32,
-}
-
-fn revealed(
-    plan: &Wrapped,
-    row: usize,
-    windows: &[(std::time::Duration, std::time::Duration, bool)],
-    position: std::time::Duration,
-    fade: Pixels,
-) -> Reveal {
-    let mut front = px(0.);
-    let mut offset = px(0.);
-    for index in plan.rows[row].clone() {
-        let mine = plan.widths.get(index).copied().unwrap_or(px(0.));
-        let word = plan.spoken.get(index).copied().unwrap_or(index);
-        let Some(&(start, end, last)) = windows.get(word) else {
-            offset += mine;
-            continue;
-        };
-
-        // a wide character or a phrase timed as one word fills at an even pace;
-        // the eased curve only reads as a flourish across Latin letters
-        let even = plan.evenly.get(word).copied().unwrap_or(false);
-        let share = match even {
-            true => progress_between(start, end, position),
-            false => swept(start, end, position, last),
-        };
-        if share > 0. {
-            // a word covering several fragments hands each its own slice of the
-            // sweep, and the edge follows whichever reaches furthest
-            let (before, whole) = plan.spans.get(index).copied().unwrap_or((px(0.), mine));
-            let part = match mine > px(0.) {
-                true => ((whole * share - before) / mine).clamp(0., 1.),
-                false => 0.,
-            };
-            let reach = offset + mine * part;
-            if part > 0. && reach > front {
-                front = reach;
-            }
-        }
-        offset += mine;
-    }
-
-    // The edge keeps one soft trail the whole way across a row, no wider than
-    // the text left to reveal. Letting it harden at every word would drag the
-    // visible edge back each time, and a word can end mid-word: providers split
-    // "nothing" into "no" and "thing".
-    let landing = match fade > px(0.) {
-        true => ((offset - front) / fade).min(1.),
-        false => 0.,
-    };
-
-    Reveal {
-        shown: front > px(0.),
-        width: Some(front),
-        share: 1.,
-        landing,
     }
 }
 
@@ -2074,6 +2077,10 @@ fn secondary_lyrics_lane(
         }
     };
     let tint = shade(line_active);
+    let sung = Sung {
+        base_tint: tint,
+        ..sung
+    };
     let size = sung.lane;
     let karaoke_capable = sung.karaoke && lane.worded();
     let lyrics = div()
@@ -2140,6 +2147,7 @@ fn romanized_lyrics_lane(text: String, size: Pixels, theme: &ui::Theme) -> Div {
         .child(SharedString::from(text))
 }
 
+#[allow(dead_code)]
 fn karaoke_window(
     line_start: std::time::Duration,
     words: &[music::LyricsWord],
@@ -2305,7 +2313,9 @@ struct Wrapped {
     spoken: Vec<usize>,
     rows: Vec<Range<usize>>,
     widths: Vec<Pixels>,
+    #[allow(dead_code)]
     spans: Vec<(Pixels, Pixels)>,
+    #[allow(dead_code)]
     evenly: Vec<bool>,
     text: Vec<SharedString>,
 }
@@ -2505,6 +2515,7 @@ fn anchored_lyrics_offset(view: Pixels, item: Pixels, height: Pixels, reach: Pix
     delta.clamp(-reach, px(0.))
 }
 
+#[allow(dead_code)]
 fn swept(
     start: std::time::Duration,
     end: std::time::Duration,
@@ -2792,7 +2803,7 @@ mod tests {
         QueuePosition, Sections, Slot, active_lyrics_row, anchored_lyrics_offset,
         background_line_singing, karaoke_fragments, karaoke_window, lag_spring, line_has_passed,
         line_row, lyric_row_count, plain_lyrics_fragments, primary_karaoke_fade,
-        primary_karaoke_visible, secondary_karaoke_visible, wrap_fragment_widths,
+        primary_karaoke_visible, secondary_karaoke_visible, word_spotlight, wrap_fragment_widths,
     };
     use gpui::px;
     use ui::Motion;
@@ -3259,5 +3270,108 @@ mod tests {
         };
 
         assert!(line_has_passed(&line, Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn estimated_words_participate_in_primary_karaoke() {
+        let lines = vec![
+            LyricsLine {
+                start: Duration::from_secs(10),
+                end: Some(Duration::from_secs(15)),
+                text: "Hold to the time that you know".to_owned(),
+                romanized: None,
+                words: None,
+                secondary: Vec::new(),
+                voice: Voice::Lead,
+            },
+            LyricsLine {
+                start: Duration::from_secs(15),
+                end: Some(Duration::from_secs(20)),
+                text: "Locked in my room, four black walls".to_owned(),
+                romanized: None,
+                words: None,
+                secondary: Vec::new(),
+                voice: Voice::Lead,
+            },
+        ];
+
+        let prepared = music::lyrics::estimate_words_if_needed(&lines);
+        assert!(prepared[0].worded());
+        assert!(prepared[0].words.is_some());
+        assert_eq!(prepared[0].words.as_ref().unwrap().len(), 7);
+
+        // Active line at 12s is visible in primary karaoke
+        assert!(primary_karaoke_visible(
+            &prepared[0],
+            true,
+            Duration::from_secs(12)
+        ));
+    }
+
+    #[test]
+    fn word_spotlight_highlights_active_word_and_decays() {
+        let words = vec![
+            LyricsWord {
+                start: Duration::from_millis(1000),
+                end: Duration::from_millis(1500),
+                text: "Madrid".to_owned(),
+            },
+            LyricsWord {
+                start: Duration::from_millis(1600),
+                end: Duration::from_millis(2000),
+                text: "again".to_owned(),
+            },
+        ];
+
+        // Far before start -> 0.0
+        assert_eq!(word_spotlight(&words, 0, Duration::from_millis(500)), 0.0);
+
+        // Near start (lead-in at 950ms, lead_in is 90ms) -> > 0.0 and < 1.0
+        let lead = word_spotlight(&words, 0, Duration::from_millis(950));
+        assert!(lead > 0.0 && lead < 1.0);
+
+        // During word (1200ms) -> exactly 1.0
+        assert_eq!(word_spotlight(&words, 0, Duration::from_millis(1200)), 1.0);
+
+        // During word at start (1000ms) -> exactly 1.0
+        assert_eq!(word_spotlight(&words, 0, Duration::from_millis(1000)), 1.0);
+
+        // Word 0 is held up to next.start (1600ms)
+        assert_eq!(word_spotlight(&words, 0, Duration::from_millis(1550)), 1.0);
+
+        // Near end during fade out after next word starts (1650ms) -> > 0.0 and < 1.0
+        let decay = word_spotlight(&words, 0, Duration::from_millis(1650));
+        assert!(decay > 0.0 && decay < 1.0);
+
+        // After fade out (1800ms) -> 0.0
+        assert_eq!(word_spotlight(&words, 0, Duration::from_millis(1800)), 0.0);
+
+        // Second word at 1200ms is 0.0
+        assert_eq!(word_spotlight(&words, 1, Duration::from_millis(1200)), 0.0);
+
+        // Second word at 1700ms is 1.0
+        assert_eq!(word_spotlight(&words, 1, Duration::from_millis(1700)), 1.0);
+    }
+
+    #[test]
+    fn unworded_lines_when_karaoke_disabled() {
+        let lines = vec![LyricsLine {
+            start: Duration::from_secs(10),
+            end: Some(Duration::from_secs(15)),
+            text: "Hold to the time that you know".to_owned(),
+            romanized: None,
+            words: None,
+            secondary: Vec::new(),
+            voice: Voice::Lead,
+        }];
+
+        // When karaoke is disabled, lines are untouched (words are None)
+        assert!(!lines[0].worded());
+        assert!(lines[0].words.is_none());
+
+        // When karaoke is enabled, words are estimated
+        let prepared = music::lyrics::estimate_words_if_needed(&lines);
+        assert!(prepared[0].worded());
+        assert!(prepared[0].words.is_some());
     }
 }

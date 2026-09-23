@@ -357,6 +357,8 @@ impl Default for Values {
                 "Apple Music",
                 "Musixmatch",
                 "LrcLib",
+                "Kugou",
+                "NetEase",
             ]
             .map(str::to_owned)
             .to_vec(),

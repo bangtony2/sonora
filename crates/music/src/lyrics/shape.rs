@@ -363,3 +363,301 @@ fn worded_from(text: &str, slots: &[Slot], spans: &[(Duration, Duration)]) -> Ve
     }
     words
 }
+
+/// Splits a plain line into space-delimited or CJK breakable word fragments,
+/// preserving exact spacing and characters when concatenated.
+pub fn plain_lyrics_fragments(line: &str) -> Vec<String> {
+    let mut fragments = Vec::new();
+    let mut start = 0;
+    let mut spacing = false;
+    let mut previous = None;
+    for (index, letter) in line.char_indices() {
+        if letter.is_whitespace() {
+            spacing = true;
+        } else if spacing || previous.is_some_and(|prev| is_breakable_cjk(prev, letter)) {
+            fragments.push(line[start..index].to_owned());
+            start = index;
+            spacing = false;
+        }
+        previous = Some(letter);
+    }
+    if start < line.len() {
+        fragments.push(line[start..].to_owned());
+    }
+    fragments
+}
+
+fn is_breakable_cjk(left: char, right: char) -> bool {
+    let is_cjk = |c: char| {
+        matches!(c,
+            '\u{1100}'..='\u{115F}'
+            | '\u{2E80}'..='\u{A4CF}'
+            | '\u{AC00}'..='\u{D7A3}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE10}'..='\u{FE19}'
+            | '\u{FE30}'..='\u{FE6F}'
+            | '\u{FF00}'..='\u{FF60}'
+            | '\u{FFE0}'..='\u{FFE6}'
+        )
+    };
+    if !is_cjk(left) || !is_cjk(right) {
+        return false;
+    }
+    !matches!(
+        right,
+        '、' | '。'
+            | '，'
+            | '．'
+            | '！'
+            | '？'
+            | '：'
+            | '；'
+            | '」'
+            | '』'
+            | '）'
+            | '】'
+            | '〉'
+            | '》'
+            | '〕'
+            | '・'
+            | 'ー'
+            | '…'
+            | '々'
+            | 'ゝ'
+            | 'ゞ'
+            | 'っ'
+            | 'ッ'
+    ) && !matches!(left, '「' | '『' | '（' | '【' | '〈' | '《' | '〔')
+}
+
+fn count_syllables(word: &str) -> usize {
+    let clean: String = word
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphabetic())
+        .collect();
+    if clean.is_empty() {
+        return 1;
+    }
+
+    let is_vowel = |c: char| {
+        matches!(
+            c,
+            'a' | 'e'
+                | 'i'
+                | 'o'
+                | 'u'
+                | 'y'
+                | 'а'
+                | 'е'
+                | 'ё'
+                | 'и'
+                | 'о'
+                | 'у'
+                | 'ы'
+                | 'э'
+                | 'ю'
+                | 'я'
+                | 'ä'
+                | 'ö'
+                | 'ü'
+                | 'é'
+                | 'è'
+                | 'ê'
+                | 'à'
+                | 'â'
+                | 'î'
+                | 'ô'
+                | 'ù'
+                | 'û'
+        )
+    };
+    let mut count = 0;
+    let mut in_vowel_group = false;
+
+    for c in clean.chars() {
+        if is_vowel(c) {
+            if !in_vowel_group {
+                count += 1;
+                in_vowel_group = true;
+            }
+        } else {
+            in_vowel_group = false;
+        }
+    }
+
+    if count > 1 && clean.ends_with('e') && !clean.ends_with("le") && !clean.ends_with("ee") {
+        count -= 1;
+    }
+
+    count.max(1)
+}
+
+/// Estimates word-by-word timestamps for a line of synced lyrics that lacks word timings.
+pub fn estimate_line_words(
+    text: &str,
+    start: Duration,
+    end: Option<Duration>,
+    next_start: Option<Duration>,
+) -> Option<Vec<LyricsWord>> {
+    let fragments = plain_lyrics_fragments(text);
+    if fragments.is_empty() || fragments.iter().all(|f| f.trim().is_empty()) {
+        return None;
+    }
+
+    let available = match (end, next_start) {
+        (Some(end), Some(next)) => end.min(next).saturating_sub(start),
+        (Some(end), None) => end.saturating_sub(start),
+        (None, Some(next)) => next.saturating_sub(start),
+        (None, None) => Duration::from_secs(4),
+    };
+
+    let mut total_syllables = 0usize;
+    let weights: Vec<f64> = fragments
+        .iter()
+        .enumerate()
+        .map(|(index, fragment)| {
+            let clean = fragment.trim();
+            let syllables = count_syllables(clean);
+            total_syllables += syllables;
+
+            let mut weight = (syllables as f64) * 2.0;
+
+            // Trailing punctuation denotes a phrasing pause / held breath
+            if clean.ends_with(',') || clean.ends_with(';') || clean.ends_with(':') {
+                weight += 1.0;
+            } else if clean.ends_with("...") || clean.ends_with('—') || clean.ends_with('-') {
+                weight += 1.5;
+            } else if clean.ends_with('!') || clean.ends_with('?') || clean.ends_with('.') {
+                weight += 1.0;
+            }
+
+            // The final word in a line sustains across the remainder of the measure
+            if index + 1 == fragments.len() {
+                weight += 1.5;
+            }
+
+            weight
+        })
+        .collect();
+
+    let estimated = Duration::from_millis((total_syllables as u64 * 320) + 400);
+
+    let singing_duration = if available <= estimated {
+        let pause = Duration::from_millis(200).min(available.mul_f64(0.08));
+        available
+            .saturating_sub(pause)
+            .max(Duration::from_millis(400))
+    } else if available >= Duration::from_secs(7) && available >= estimated + Duration::from_secs(3)
+    {
+        let max_sing = available.saturating_sub(Duration::from_secs(2));
+        estimated.mul_f64(1.25).min(max_sing)
+    } else {
+        let pause = Duration::from_millis(280).min(available.mul_f64(0.08));
+        available.saturating_sub(pause).max(estimated)
+    };
+
+    let total_weight: f64 = weights.iter().sum();
+    if total_weight <= 0.0 {
+        return None;
+    }
+
+    let mut words = Vec::with_capacity(fragments.len());
+    let mut elapsed = Duration::ZERO;
+    for (index, fragment) in fragments.into_iter().enumerate() {
+        let weight = weights[index];
+        let share = weight / total_weight;
+        let delta = singing_duration.mul_f64(share);
+        let word_start = start + elapsed;
+        let word_end = if index + 1 == weights.len() {
+            start + singing_duration
+        } else {
+            word_start + delta
+        };
+        elapsed += delta;
+        words.push(LyricsWord {
+            start: word_start,
+            end: word_end.max(word_start),
+            text: fragment,
+        });
+    }
+
+    Some(words)
+}
+
+/// Populates estimated words for any lines in a synced lyrics sheet that lack word timings.
+pub fn estimate_words_if_needed(lines: &[LyricsLine]) -> Vec<LyricsLine> {
+    let mut prepared = lines.to_vec();
+    for index in 0..prepared.len() {
+        let next_start = lines.get(index + 1).map(|next| next.start);
+        if prepared[index]
+            .words
+            .as_ref()
+            .map_or(true, |w| w.is_empty())
+        {
+            prepared[index].words = estimate_line_words(
+                &prepared[index].text,
+                prepared[index].start,
+                prepared[index].end,
+                next_start,
+            );
+        }
+        let line_end = prepared[index].end;
+        for lane in &mut prepared[index].secondary {
+            if lane.words.as_ref().map_or(true, |w| w.is_empty()) {
+                lane.words =
+                    estimate_line_words(&lane.text, lane.start, lane.end.or(line_end), next_start);
+            }
+        }
+    }
+    prepared
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    #[test]
+    fn estimates_words_for_plain_synced_line() {
+        let text = "Hold to the time that you know";
+        let start = Duration::from_secs(10);
+        let next = Duration::from_secs(14);
+        let words =
+            estimate_line_words(text, start, Some(next), Some(next)).expect("should produce words");
+
+        assert_eq!(words.len(), 7);
+        let joined: String = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(joined, text);
+
+        for (i, word) in words.iter().enumerate() {
+            assert!(word.start >= start);
+            assert!(word.end >= word.start);
+            if i + 1 < words.len() {
+                assert!(words[i + 1].start >= word.start);
+            }
+        }
+        assert!(words.last().unwrap().end <= next);
+    }
+
+    #[test]
+    fn preserves_existing_word_timings() {
+        let existing = LyricsWord {
+            start: Duration::from_secs(2),
+            end: Duration::from_secs(3),
+            text: "Hello".to_owned(),
+        };
+        let lines = vec![LyricsLine {
+            start: Duration::from_secs(2),
+            end: Some(Duration::from_secs(5)),
+            text: "Hello world".to_owned(),
+            romanized: None,
+            words: Some(vec![existing.clone()]),
+            secondary: Vec::new(),
+            voice: Voice::Lead,
+        }];
+
+        let result = estimate_words_if_needed(&lines);
+        assert_eq!(result[0].words.as_ref().unwrap().len(), 1);
+        assert_eq!(result[0].words.as_ref().unwrap()[0], existing);
+    }
+}
